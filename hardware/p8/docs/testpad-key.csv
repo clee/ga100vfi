@@ -1,0 +1,20 @@
+Reference,Silkscreen label,Net,X mm,Y mm,Use
+TP18,ARMR,HOST_ARM_RAW,163.1093,148.4343,High-impedance observation only
+TP19,ARM,HOST_ARM,170.6833,144.4667,High-impedance observation only
+TP20,PMTR,HOST_PERMIT_RAW,173.1307,144.1398,High-impedance observation only
+TP21,PMT,HOST_PERMIT,172.05,149.575,High-impedance observation only
+TP22,CFG,CONFIG_VALID,165.125,137.25,High-impedance observation only
+TP23,RSTOK,RESET_OK,137.3844,133.45,High-impedance observation only
+TP24,CPOK,COMP_OK_FAST,155.7063,122.35,High-impedance observation only
+TP25,T25,OVP_OK,135.244079,140.193421,High-impedance observation only
+TP26,RISE,RISE_RECENT,143.8775,131.5525,High-impedance observation only
+TP27,FALL,FALL_RECENT,151.75,127.37,High-impedance observation only
+TP28,EDGE,EDGE_OVP_OK,157.6917,133.425,High-impedance observation only
+TP29,SYS,SYSTEM_OK,156.4697,135.3947,High-impedance observation only
+TP30,HEALTH,HEALTH_CLEAR_N,163.6,139.425,High-impedance observation only
+TP31,CLR,HARD_CLEAR_N,162.475,145.342,High-impedance observation only
+TP32,OE,SYNTH_OE_N,113.925,140.775,High-impedance observation only
+TP33,VIN,USB_REG_IN,165.7703,112.0541,High-impedance observation only
+TP34,GND,GND,169.95,155.5,Local ground return
+TP35,T35,GND,148.5,129.125,Local ground return
+TP36,GND,GND,170.5,112.5,Local ground return

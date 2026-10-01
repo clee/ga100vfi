@@ -1,0 +1,12 @@
+{
+  "mv1": null,
+  "ccr1": null,
+  "mv2": null,
+  "ccr2": null,
+  "gain_ppm": null,
+  "offset_mv": null,
+  "boot_min_mv": null,
+  "boot_max_mv": null,
+  "load_min_mv": null,
+  "load_max_mv": null
+}

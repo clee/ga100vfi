@@ -1,0 +1,1 @@
+(fp_lib_table (lib (name "PWMVID")(type "KiCad")(uri "${KIPRJMOD}/PWMVID.pretty")(options "")(descr "PCB-specific connector, wire terminals and RGB footprints; engineering review required")))

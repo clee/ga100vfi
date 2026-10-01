@@ -1,0 +1,9 @@
+{
+  "background": {"ccr": 155},
+  "steps": [
+    {"target": {"ccr": 155}, "duration_ns": 20000000},
+    {"target": {"ccr": 149}, "duration_ns": 14000},
+    {"target": {"ccr": 155}, "duration_ns": 20000000}
+  ],
+  "post": {"ccr": 155}
+}

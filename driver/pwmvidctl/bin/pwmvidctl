@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""PWMVID operator CLI; offline commands never touch the board."""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from lib.pwmvid import validate_profile  # noqa: E402
+from lib.sequence_run import prepare_sequence  # noqa: E402
+
+PRIVATE_PROFILE = Path.home() / ".config/pwmvid/profile.json"
+BUNDLED_PROFILE = ROOT / "profiles/gpu0-operational.json"
+DEFAULT_OUTPUT = Path.home() / ".local/share/pwmvid-operator-kit"
+TERMINAL_JOBS = {"completed", "failed", "stopped"}
+
+
+class OperatorError(Exception):
+    pass
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        raise OperatorError("API redirect refused; bearer token was not forwarded")
+
+
+def profile_file(args):
+    if args.profile is not None:
+        return args.profile
+    return PRIVATE_PROFILE if PRIVATE_PROFILE.is_file() else BUNDLED_PROFILE
+
+
+def local_profile(args):
+    path = profile_file(args)
+    try:
+        return validate_profile(json.loads(path.read_text())), path
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise OperatorError(f"Cannot load measured profile {path}: {exc}") from exc
+
+
+def api_request(args, path, data=None):
+    parsed = urlparse(args.api_url)
+    if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "::1") or
+            parsed.username or parsed.password or parsed.path not in ("", "/") or
+            parsed.query or parsed.fragment):
+        raise OperatorError("API URL must be a loopback HTTP origin; refusing to send the token elsewhere")
+    token_path = args.token_file
+    try:
+        token = token_path.read_text().strip()
+    except OSError as exc:
+        raise OperatorError(f"Cannot read local API token file {token_path}: {exc}") from exc
+    if len(token) < 32:
+        raise OperatorError("Local API token is missing or invalid")
+    body = None if data is None else json.dumps(data, separators=(",", ":")).encode()
+    request = Request(args.api_url.rstrip("/") + "/api/v1/" + path,
+                      data=body,
+                      headers={"Authorization": "Bearer " + token,
+                               **({"Content-Type": "application/json"} if body is not None else {})},
+                      method="GET" if body is None else "POST")
+    try:
+        with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=5) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        try:
+            detail = json.load(exc).get("error", "HTTP error")
+        except (ValueError, OSError, AttributeError):
+            detail = "HTTP error"
+        raise OperatorError(f"API {exc.code}: {detail}") from exc
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        raise OperatorError(f"PWMVID API unavailable: {exc}") from exc
+
+
+def state(args):
+    return api_request(args, "state")
+
+
+def capture(telem, prefix):
+    try:
+        period, high = int(telem[prefix + "_p"]), int(telem[prefix + "_h"])
+        if period <= 0 or high <= 0 or high >= period:
+            return None
+        return {"period_ticks": period, "high_ticks": high,
+                "frequency_khz": round(162000 / period, 3),
+                "duty_pct": round(100 * high / period, 3),
+                "ccr": (240 * high + period // 2) // period}
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def reading(snapshot):
+    telem = snapshot.get("telemetry") or {}
+    gpu = capture(telem, "gpu") if telem.get("gpu_ok") == "1" else None
+    vrm = capture(telem, "vrm") if telem.get("vrm_ok") == "1" else None
+    try:
+        nvvdd = int(telem["rail_mv"]) if telem.get("adc_ok") == "1" else None
+    except (KeyError, ValueError, TypeError):
+        nvvdd = None
+    return {"received_utc": datetime.now(timezone.utc).isoformat(),
+            "connected": bool(snapshot.get("connected")),
+            "state": telem.get("state"), "run": telem.get("run"),
+            "break": telem.get("break"), "gpu": gpu, "vrm": vrm,
+            "nvvdd_mv": nvvdd, "last_seen_utc": snapshot.get("last_seen_utc")}
+
+
+def ensure_profile_matches(snapshot, profile):
+    if not snapshot.get("profile_loaded") or snapshot.get("profile") != profile:
+        raise OperatorError("Installed daemon profile differs from the selected local profile")
+
+
+def ensure_arm_ready(snapshot, profile, *, mode="GPU_EXPERIMENT", start_ccr=None, start_mv=None):
+    ensure_profile_matches(snapshot, profile)
+    telem = snapshot.get("telemetry") or {}
+    if not snapshot.get("connected") or snapshot.get("armed") or telem.get("state") != "PASSIVE" or telem.get("run") != "0" or telem.get("break") != "0":
+        raise OperatorError("ARM preflight requires connected PASSIVE, RUN=0, break=0, and no active ARM")
+    sample = reading(snapshot)
+    if sample["nvvdd_mv"] is None:
+        raise OperatorError("ARM preflight requires a valid NVVDD reading")
+    mv = sample["nvvdd_mv"]
+    if mode == "GPU_STANDALONE":
+        if (start_ccr is None) == (start_mv is None):
+            raise OperatorError("Standalone ARM needs exactly one --start-ccr or --start-mv")
+        if start_ccr is not None and not min(profile["ccr1"], profile["ccr2"]) <= start_ccr <= max(profile["ccr1"], profile["ccr2"]):
+            raise OperatorError("Starting CCR is outside the installed base calibration")
+        if start_mv is not None and not profile["mv1"] <= start_mv <= profile["mv2"]:
+            raise OperatorError("Starting mV is outside the installed base calibration")
+    else:
+        if start_ccr is not None or start_mv is not None:
+            raise OperatorError("Starting target is only for GPU_STANDALONE")
+        if sample["gpu"] is None:
+            raise OperatorError("GPU-follow ARM requires a valid GPU PWM reading")
+        ccr = sample["gpu"]["ccr"]
+        if not min(profile["ccr1"], profile["ccr2"]) <= ccr <= max(profile["ccr1"], profile["ccr2"]):
+            raise OperatorError(f"Observed GPU CCR {ccr} is outside the installed profile")
+    if not profile["boot_min_mv"] <= mv <= profile["boot_max_mv"]:
+        raise OperatorError(f"Observed NVVDD {mv} mV is outside boot bounds {profile['boot_min_mv']}..{profile['boot_max_mv']} mV")
+
+
+def wait_job(args, job_id, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = api_request(args, "jobs/" + job_id)
+        if job.get("state") in TERMINAL_JOBS:
+            return job
+        time.sleep(0.1)
+    raise OperatorError(f"Job {job_id} did not finish within {timeout:.1f}s; inspect 'job {job_id}'. No command was retried")
+
+
+def require_completed(job):
+    if job.get("state") != "completed":
+        raise OperatorError(f"Job {job.get('id')} ended {job.get('state')}: {job.get('error')}")
+    return job
+
+
+def write_private_json(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    old_umask = os.umask(0o077)
+    try:
+        try:
+            with path.open("x") as stream:
+                json.dump(data, stream, indent=2)
+                stream.write("\n")
+        except FileExistsError as exc:
+            raise OperatorError(f"Output already exists: {path}") from exc
+    finally:
+        os.umask(old_umask)
+
+
+def record_data(args):
+    data = api_request(args, "calibration/recording")
+    if data.get("recording") is None:
+        raise OperatorError("No recording is available")
+    return data
+
+
+def command(args):
+    if args.action == "status":
+        snap = state(args)
+        if args.json:
+            print(json.dumps(snap, indent=2)); return
+        sample = reading(snap)
+        print(f"Service: {'connected' if sample['connected'] else 'waiting for exact USB board'}; firmware: {sample['state'] or 'unknown'}; RUN={sample['run'] or '?'}; break={sample['break'] or '?'}")
+        for name in ("gpu", "vrm"):
+            value = sample[name]
+            print(f"{name.upper()} PWM: " + (f"{value['frequency_khz']:.1f} kHz, {value['duty_pct']:.2f}% (CCR~{value['ccr']})" if value else "no valid capture"))
+        print("NVVDD: " + (f"{sample['nvvdd_mv']} mV nominal ADC" if sample["nvvdd_mv"] is not None else "no valid reading"))
+        print(f"Base profile: {'loaded' if snap.get('profile_loaded') else 'absent'}; ARM modes: {', '.join(snap.get('arm_modes') or []) or 'none'}")
+        return
+    if args.action == "watch":
+        if not 0.2 <= args.interval <= 60 or not 0 < args.seconds <= 3600:
+            raise OperatorError("Watch requires 0.2..60 second interval and 0..3600 second duration")
+        stream = None
+        if args.output:
+            args.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            old_umask = os.umask(0o077)
+            try:
+                try:
+                    stream = args.output.open("x")
+                except FileExistsError as exc:
+                    raise OperatorError(f"Output already exists: {args.output}") from exc
+            finally:
+                os.umask(old_umask)
+        try:
+            deadline = time.monotonic() + args.seconds
+            while True:
+                line = json.dumps(reading(state(args)), separators=(",", ":"))
+                print(line, file=stream or sys.stdout, flush=True)
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(min(args.interval, max(0, deadline - time.monotonic())))
+        finally:
+            if stream:
+                stream.close()
+                print(f"Saved telemetry JSONL: {args.output}")
+        return
+    if args.action == "profile":
+        profile, path = local_profile(args)
+        if args.offline:
+            print(json.dumps({"path": str(path), "profile": profile}, indent=2)); return
+        snap = state(args)
+        evidence = snap.get("profile_evidence")
+        print(json.dumps({"path": str(path), "local_profile": profile,
+                          "installed_matches_local": snap.get("profile") == profile,
+                          "installed_fit": evidence}, indent=2))
+        return
+    if args.action == "record":
+        if args.record_action == "start":
+            print(json.dumps(api_request(args, "calibration/start", {"card": args.card}), indent=2)); return
+        if args.record_action == "stop":
+            print(json.dumps(api_request(args, "calibration/stop", {}), indent=2)); return
+        data = record_data(args)
+        rec = data["recording"]
+        if args.record_action == "show":
+            print(json.dumps({"recording": rec, "valid_count": sum(bool(s.get("valid")) for s in data["samples"]), "fit": data.get("fit")}, indent=2)); return
+        if args.record_action == "export":
+            if not re.fullmatch(r"[A-Za-z0-9T-]+", rec["id"]):
+                raise OperatorError("Unexpected recording ID")
+            path = args.output or DEFAULT_OUTPUT / "recordings" / (rec["id"] + ".json")
+            write_private_json(path, data)
+            print(f"Saved recording JSON: {path}"); return
+        if rec.get("state") != "stopped":
+            raise OperatorError("Stop the passive recording before fitting")
+        if args.all_valid:
+            ids = [sample["index"] for sample in data["samples"] if sample.get("valid")]
+        else:
+            try:
+                ids = [int(part) for part in args.ids.split(",")]
+            except ValueError as exc:
+                raise OperatorError("--ids must contain comma-separated observation indices") from exc
+        fit = api_request(args, "calibration/fit", {"recording_id": rec["id"], "sample_ids": ids})
+        print(json.dumps(fit, indent=2)); return
+    if args.action == "plan":
+        profile, path = local_profile(args)
+        try:
+            spec = json.loads(args.file.read_text())
+            compiled, commands = prepare_sequence(profile, spec, 1)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise OperatorError(f"Plan rejected before any device command: {exc}") from exc
+        result = {"profile_path": str(path), "background_ccr": compiled["background_ccr"],
+                  "post_ccr": compiled["post_ccr"], "total_periods": compiled["total_periods"],
+                  "duration_ms": round(compiled["total_periods"] * 1000 / compiled["pwm_hz"], 6),
+                  "steps": compiled["steps"], "hardware_status": compiled["hardware_status"]}
+        if args.commands:
+            result["commands_not_sent"] = commands
+        print(json.dumps(result, indent=2)); return
+    if args.action == "delayed-status":
+        snap = state(args)
+        telem = snap.get("telemetry") or {}
+        measurement = snap.get("measurement")
+        if measurement and measurement.get("valid") == "1":
+            try:
+                hclk = int(measurement["hclk"])
+                cycles = int(measurement["interval_cycles"])
+                pwm_cycle = int(measurement["pwm_cycle"])
+                strobe_cycle = int(measurement["strobe_cycle"])
+                measurement = {**measurement,
+                               "interval_us_precise": round(cycles * 1_000_000 / hclk, 3),
+                               "dispatch_us": round(int(measurement["dispatch_cycles"]) *
+                                                    1_000_000 / hclk, 3),
+                               "strobe_to_pwm_ns": round(
+                                   ((pwm_cycle - strobe_cycle) & 0xffffffff) *
+                                   1_000_000_000 / hclk, 1)}
+            except (KeyError, ValueError, ZeroDivisionError):
+                pass
+        keys = ("dstate", "did", "dthreshold", "dlow_ms", "dhigh_ms",
+                "dstart_ms", "dfinish_ms", "dfault", "dattempt_mv", "dvbus",
+                "drun", "dready", "darm", "dtries", "dtimer", "seq_id",
+                "usb_loss", "reset")
+        print(json.dumps({"connected": snap.get("connected"),
+                          "last_seen_utc": snap.get("last_seen_utc"),
+                          "control_status": snap.get("status"),
+                          "run": telem.get("run"), "rail_mv": telem.get("rail_mv"),
+                          **{key: telem.get(key) for key in keys},
+                          "measurement": measurement}, indent=2)); return
+    if args.action == "delayed-arm":
+        if not args.confirm_drive:
+            raise OperatorError("Delayed ARM requires --confirm-drive after checking GPU0 and the PWMVID wiring")
+        profile, _ = local_profile(args)
+        try:
+            spec = json.loads(args.file.read_text())
+            compiled, _ = prepare_sequence(profile, spec, 1)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise OperatorError(f"Plan rejected before any device command: {exc}") from exc
+        if compiled["total_periods"] > 8_100_000:
+            raise OperatorError("Delayed plan exceeds the 12 second autonomous limit")
+        snap = state(args)
+        ensure_profile_matches(snap, profile)
+        telem = snap.get("telemetry") or {}
+        if not snap.get("connected") or snap.get("armed") or telem.get("state") != "PASSIVE" or \
+                telem.get("run") != "0" or telem.get("break") != "0" or "dstate" not in telem:
+            raise OperatorError("Delayed ARM needs updated firmware, connected PASSIVE, RUN=0, break=0")
+        if telem.get("dstate") in ("WAIT_LOW", "WAIT_HIGH", "READY", "RUNNING"):
+            raise OperatorError("A delayed one-shot is already active")
+        reading_mv = reading(snap)["nvvdd_mv"]
+        if reading_mv is None or reading_mv < args.threshold_mv + 25:
+            raise OperatorError("NVVDD must be measured above threshold plus 25 mV before ARM")
+        accepted = api_request(args, "delayed", {"plan": spec,
+                                                 "threshold_mv": args.threshold_mv,
+                                                 "timeout_ms": args.timeout_s * 1000})
+        print("Delayed sequence staging job " + accepted["job_id"])
+        print(json.dumps(require_completed(wait_job(args, accepted["job_id"], 10)), indent=2))
+        print("One-shot is waiting for USB loss, 20 ms below threshold, then 3 ms above threshold + 25 mV")
+        return
+    if args.action == "delayed-cancel":
+        stop_device(args); return
+    if args.action == "job":
+        print(json.dumps(api_request(args, "jobs/" + args.job_id), indent=2)); return
+    if args.action == "arm":
+        if not args.confirm_wiring:
+            raise OperatorError("ARM requires --confirm-wiring after checking the physical GPU/VRM setup")
+        profile, _ = local_profile(args)
+        ensure_arm_ready(state(args), profile, mode=args.mode,
+                         start_ccr=args.start_ccr, start_mv=args.start_mv)
+        payload = {"mode": args.mode}
+        if args.start_ccr is not None: payload["start_ccr"] = args.start_ccr
+        if args.start_mv is not None: payload["start_mv"] = args.start_mv
+        accepted = api_request(args, "arm", payload)
+        print("ARM request accepted once; job " + accepted["job_id"])
+        print(json.dumps(require_completed(wait_job(args, accepted["job_id"], 5)), indent=2))
+        print("Output remains ARMED until STOP, fault, or lease loss; issue 'stop' when finished")
+        return
+    if args.action == "sequence":
+        if not args.confirm_drive:
+            raise OperatorError("Sequence execution requires --confirm-drive; validation alone needs no confirmation")
+        if args.adc_trace_threshold_mv is not None and args.capture_output is None:
+            raise OperatorError("ADC trace requires --capture-output")
+        profile, _ = local_profile(args)
+        try:
+            spec = json.loads(args.file.read_text())
+            compiled, _ = prepare_sequence(profile, spec, 1)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise OperatorError(f"Plan rejected before any device command: {exc}") from exc
+        deadline = time.monotonic() + 0.7
+        while True:
+            snap = state(args)
+            ensure_profile_matches(snap, profile)
+            telem = snap.get("telemetry") or {}
+            if (snap.get("connected") and snap.get("armed") and
+                    telem.get("state") == "ARMED" and telem.get("run") == "1"):
+                break
+            if time.monotonic() >= deadline:
+                raise OperatorError("Sequence requires an explicitly ARMED device with RUN=1")
+            time.sleep(0.05)
+        payload = {"plan": spec}
+        if args.capture_output:
+            payload["capture_telemetry"] = True
+        if args.adc_trace_threshold_mv is not None:
+            payload["adc_trace_threshold_mv"] = args.adc_trace_threshold_mv
+        accepted = api_request(args, "sequence", payload)
+        print("Sequence request accepted once; job " + accepted["job_id"])
+        try:
+            timeout = compiled["total_periods"] / compiled["pwm_hz"] + 10
+            job = require_completed(wait_job(args, accepted["job_id"], timeout))
+            if args.capture_output:
+                write_private_json(args.capture_output, {"plan": spec,
+                                                        "compiled_plan": compiled,
+                                                        "job": job})
+                samples = job["result"]["fast_telemetry"]["samples"]
+                print(f"Saved {len(samples)} fast telemetry samples: {args.capture_output}")
+                if "adc_trace" in job["result"]:
+                    trace = job["result"]["adc_trace"]
+                    print(f"ADC trace: {len(trace['frames'])} edge windows, "
+                          f"{trace['status']['cycles_per_scan']} CPU cycles per scan, "
+                          f"complete={trace['complete']}")
+            else:
+                print(json.dumps(job, indent=2))
+            print("Post duty stays active; issue 'stop' when finished")
+        finally:
+            if args.stop_after:
+                stop_device(args)
+        return
+    if args.action == "background":
+        if not args.confirm_drive:
+            raise OperatorError("Background change requires --confirm-drive")
+        profile, _ = local_profile(args)
+        snap = state(args)
+        ensure_profile_matches(snap, profile)
+        telem = snap.get("telemetry") or {}
+        if not snap.get("connected") or not snap.get("armed") or telem.get("state") != "ARMED" or telem.get("run") != "1":
+            raise OperatorError("Background change requires an explicitly ARMED device with RUN=1")
+        target = {"mv": args.mv} if args.mv is not None else {"ccr": args.ccr}
+        if args.mv is not None and not profile["mv1"] <= args.mv <= profile["mv2"]:
+            raise OperatorError("Background mV is outside the stock/base calibration")
+        if args.ccr is not None and not min(profile["ccr1"], profile["ccr2"]) <= args.ccr <= max(profile["ccr1"], profile["ccr2"]):
+            raise OperatorError("Background CCR is outside the stock/base calibration")
+        accepted = api_request(args, "background", target)
+        print(json.dumps(require_completed(wait_job(args, accepted["job_id"], 5)), indent=2))
+        return
+    if args.action == "stop":
+        stop_device(args); return
+    if args.action == "reset":
+        if not args.confirm:
+            raise OperatorError("Fault RESET requires --confirm")
+        snap = state(args); telem = snap.get("telemetry") or {}
+        if telem.get("state") != "FAULT" or telem.get("run") != "0" or telem.get("break") != "0":
+            raise OperatorError("RESET requires a non-running fault and no active break")
+        accepted = api_request(args, "reset", {})
+        print(json.dumps(require_completed(wait_job(args, accepted["job_id"], 5)), indent=2)); return
+    raise OperatorError("Unknown action")
+
+
+def stop_device(args):
+    accepted = api_request(args, "stop", {})
+    if "job_id" in accepted:
+        print(json.dumps(require_completed(wait_job(args, accepted["job_id"], 5)), indent=2))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        snap = state(args); telem = snap.get("telemetry") or {}
+        if telem.get("run") == "0" and telem.get("state") in ("PASSIVE", "FAULT"):
+            print("Output disabled: RUN=0, state=" + telem["state"]); return
+        time.sleep(0.1)
+    raise OperatorError("STOP accepted but RUN=0 was not confirmed; inspect board state")
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--api-url", default="http://127.0.0.1:4183", help="Loopback PWMVID daemon origin")
+    p.add_argument("--token-file", type=Path, default=Path.home() / ".config/pwmvid/token", help="Read existing bearer token at runtime; never printed")
+    p.add_argument("--profile", type=Path, help="Local measured profile; defaults to installed private profile, else bundled GPU0 copy")
+    commands = p.add_subparsers(dest="action", required=True)
+    status = commands.add_parser("status", help="Read cached daemon and board status")
+    status.add_argument("--json", action="store_true")
+    watch = commands.add_parser("watch", help="Read telemetry over time as JSONL; never sends board commands")
+    watch.add_argument("--seconds", type=float, default=10)
+    watch.add_argument("--interval", type=float, default=0.5, help="Seconds between cached-state reads")
+    watch.add_argument("--output", type=Path, help="New JSONL file; default stdout")
+    profile = commands.add_parser("profile", help="Show local base profile and daemon fit evidence")
+    profile.add_argument("--offline", action="store_true", help="No daemon request or token read")
+    record = commands.add_parser("record", help="Passive recording and fit; never arms")
+    actions = record.add_subparsers(dest="record_action", required=True)
+    start = actions.add_parser("start", help="Start native GPU PWM/NVVDD observation journal")
+    start.add_argument("--card", required=True)
+    actions.add_parser("stop", help="Stop passive recording")
+    actions.add_parser("show", help="Show latest recording summary and fit")
+    export = actions.add_parser("export", help="Save all latest observations to a private JSON file")
+    export.add_argument("--output", type=Path)
+    fit = actions.add_parser("fit", help="Fit reviewed valid observation indices")
+    chosen = fit.add_mutually_exclusive_group(required=True)
+    chosen.add_argument("--ids", help="Comma-separated selected observation indices")
+    chosen.add_argument("--all-valid", action="store_true", help="Fit all valid points only after reviewing the recording")
+    plan = commands.add_parser("plan", help="Offline sequence validation; never contacts the daemon")
+    plan.add_argument("file", type=Path)
+    plan.add_argument("--commands", action="store_true", help="Print generated verbs without sending them")
+    delayed = commands.add_parser("delayed-arm", help="Stage one autonomous sequence for the next S3 rail fall and rise")
+    delayed.add_argument("file", type=Path, help="The same JSON format as 'plan' and 'sequence'")
+    delayed.add_argument("--threshold-mv", type=int, default=200)
+    delayed.add_argument("--timeout-s", type=int, default=120, help="One-shot arming deadline, 1..120 seconds")
+    delayed.add_argument("--confirm-drive", action="store_true")
+    commands.add_parser("delayed-status", help="Read the last delayed one-shot receipt after boot")
+    commands.add_parser("delayed-cancel", help="Cancel an armed or running delayed one-shot with STOP")
+    job = commands.add_parser("job", help="Read a daemon job receipt")
+    job.add_argument("job_id")
+    arm = commands.add_parser("arm", help="Explicitly ARM after physical setup checks")
+    arm.add_argument("--mode", choices=("GPU_EXPERIMENT", "FIXTURE_ISOLATED", "GPU_STANDALONE"), required=True)
+    target = arm.add_mutually_exclusive_group()
+    target.add_argument("--start-ccr", type=int, help="Explicit standalone starting CCR within base calibration")
+    target.add_argument("--start-mv", type=int, help="Explicit standalone starting target mV within base calibration")
+    arm.add_argument("--confirm-wiring", action="store_true")
+    sequence = commands.add_parser("sequence", help="Run one validated plan on an already ARMED board")
+    sequence.add_argument("file", type=Path)
+    sequence.add_argument("--confirm-drive", action="store_true")
+    sequence.add_argument("--stop-after", action="store_true", help="Send STOP after job completion or error")
+    sequence.add_argument("--capture-output", type=Path,
+                          help="Save high-rate TELEM samples during a sequence to a new private JSON file")
+    sequence.add_argument("--adc-trace-threshold-mv", type=int,
+                          help="Also capture four raw ADC edge windows around this crossing voltage")
+    background = commands.add_parser("background", help="Set a steady background using the installed stock/base calibration")
+    background_target = background.add_mutually_exclusive_group(required=True)
+    background_target.add_argument("--mv", type=int, help="Calibrated NVVDD target mV")
+    background_target.add_argument("--ccr", type=int, help="Direct PWM CCR within measured profile")
+    background.add_argument("--confirm-drive", action="store_true")
+    commands.add_parser("stop", help="Request STOP and confirm RUN=0")
+    reset = commands.add_parser("reset", help="Explicit non-running fault reset")
+    reset.add_argument("--confirm", action="store_true")
+    return p
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        command(args)
+    except (OperatorError, OSError, ValueError, KeyError, KeyboardInterrupt) as exc:
+        print(f"pwmvidctl: {exc or 'interrupted'}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,16 @@
+[package]
+name = "gpu0-analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glitch-contract = { path = "../contract" }
+gpu0-capture = { path = "../gpu0-capture" }
+leaf-api = { path = "../leaf-api" }
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

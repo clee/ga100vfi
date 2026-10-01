@@ -1,0 +1,19 @@
+Assembly orientation request — D1
+
+Please keep D1 in the factory assembly: MEIHUA MHTC197CRGBCT, JLC/LCSC C3028844. The public JLC preview has no numbered library model for this part, so please confirm the physical orientation against the attached D1-assembly-orientation.png and manufacturer top-view drawing before assembly.
+
+Viewed from the component side with the USB connector toward the top of the board:
+- Pin 1: green anode, lower left
+- Pin 2: blue anode, upper left
+- Pin 3: red anode, upper right
+- Pin 4: common cathode, lower right
+
+Native board coordinates in mm, X right and Y down:
+Pin 1: X172.3 Y136.6
+Pin 2: X172.3 Y135.4
+Pin 3: X173.7 Y135.4
+Pin 4: X173.7 Y136.6
+Component center: X173.0 Y136.0
+The CPL uses Cartesian Y-up, so its D1 center is X173.0 Y-136.0. Each copper land is 0.8 x 0.8 mm.
+
+D1's current CPL angle 0 is the native convention, not a verified JLC library angle. Please use the physical pin-to-land mapping above and confirm the appropriate machine rotation. Do not omit D1 or substitute a different LED. The board artwork is P8; P9 is the assembly-file revision.

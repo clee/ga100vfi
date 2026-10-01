@@ -1,0 +1,12 @@
+{
+  "mv1": 600,
+  "ccr1": 69,
+  "mv2": 1000,
+  "ccr2": 168,
+  "gain_ppm": 1000000,
+  "offset_mv": 0,
+  "boot_min_mv": 100,
+  "boot_max_mv": 1100,
+  "load_min_mv": 100,
+  "load_max_mv": 1100
+}

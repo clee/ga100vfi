@@ -1,0 +1,19 @@
+[package]
+name = "gpu0-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+linux-bar0 = ["dep:memmap2", "dep:libc"]
+
+[dependencies]
+glitch-contract = { path = "../contract" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+memmap2 = { version = "0.9.9", optional = true }
+libc = { version = "0.2.191", optional = true }

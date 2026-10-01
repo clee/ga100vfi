@@ -1,0 +1,1 @@
+(footprint "WirePair_1p2mm_3mm" (version 20241229) (generator pcbnew) (layer "F.Cu") (attr through_hole) (pad "1" thru_hole circle (at 0 0) (size 2.4 2.4) (drill 1.2) (layers "*.Cu" "*.Mask")) (pad "2" thru_hole circle (at 0 3) (size 2.4 2.4) (drill 1.2) (layers "*.Cu" "*.Mask")))

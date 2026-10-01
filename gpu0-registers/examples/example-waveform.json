@@ -1,0 +1,12 @@
+{
+  "background": {"kind": "millivolts", "value": 905},
+  "steps": [
+    {"target": {"kind": "millivolts", "value": 905}, "duration_ns": 981116790},
+    {"target": {"kind": "duty_basis_points", "value": 100}, "duration_ns": 24500000},
+    {"target": {"kind": "millivolts", "value": 905}, "duration_ns": 1000},
+    {"target": {"kind": "duty_basis_points", "value": 125}, "duration_ns": 1499000},
+    {"target": {"kind": "millivolts", "value": 905}, "duration_ns": 10028000}
+  ],
+  "post": {"kind": "millivolts", "value": 905},
+  "delayed_trigger": {"threshold_mv": 200, "timeout_ms": 120000}
+}

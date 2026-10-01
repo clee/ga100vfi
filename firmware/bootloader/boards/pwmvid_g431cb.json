@@ -1,0 +1,9 @@
+{
+  "build": {"cpu":"cortex-m4","extra_flags":"-DSTM32G431xx","f_cpu":"16000000L","mcu":"stm32g431cbt6","product_line":"STM32G431xx"},
+  "debug": {"default_tools":["stlink"],"jlink_device":"STM32G431CB","openocd_target":"stm32g4x","svd_path":"STM32G431xx.svd"},
+  "frameworks":["stm32cube"],
+  "name":"PWMVID P8/P9 STM32G431CBT6 custom USB loader",
+  "upload":{"maximum_ram_size":22520,"maximum_size":8192,"protocol":"stlink","protocols":["stlink"],"require_upload_port":false},
+  "url":"https://www.st.com/en/microcontrollers-microprocessors/stm32g431cb.html",
+  "vendor":"Custom prototype"
+}

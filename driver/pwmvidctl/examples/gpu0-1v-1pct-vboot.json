@@ -1,0 +1,10 @@
+{
+  "background": {"mv": 600},
+  "steps": [
+    {"target": {"mv": 600}, "duration_ns": 100000000},
+    {"target": {"mv": 1000}, "duration_ns": 250000000},
+    {"target": {"duty_pct": "1"}, "duration_ns": 100000000},
+    {"target": {"mv": 1000}, "duration_ns": 250000000}
+  ],
+  "post": {"mv": 1000}
+}

@@ -1,0 +1,11 @@
+{
+  "background": {"duty_pct": "25"},
+  "steps": [
+    {"target": "lowest", "duration_ns": 500000000},
+    {"target": {"duty_pct": "25"}, "duration_ns": 1204553106},
+    {"target": {"duty_pct": "1"}, "duration_ns": 14000},
+    {"target": {"duty_pct": "20"}, "duration_ns": 334500434},
+    {"target": {"duty_pct": "1"}, "duration_ns": 100000}
+  ],
+  "post": {"duty_pct": "25"}
+}
